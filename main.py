@@ -1,69 +1,95 @@
-from flask import Flask, render_template, redirect, request, session
-from functools import wraps
-import sqlite3
+from flask import Flask, request, render_template, redirect, url_for
+import json
+import os
+import pyotp
+from passlib.hash import pbkdf2_sha256 as sha256
 
 app = Flask(__name__)
-app.secret_key = "your_secret_key"  # Set a secret key for session security
+app.static_folder = 'static'
 
-# Custom decorator to check if user is logged in
-def login_required(f):
-    @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if "username" not in session:
-            return redirect("/login")
-        return f(*args, **kwargs)
-    return decorated_function
+DATA_FILE = 'data.json'
 
-@app.route("/")
-def root():
-    if "username" in session:
-        return redirect("/index")
-    return redirect("/login")
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'w') as f:
+            json.dump({"users": []}, f)
+    with open(DATA_FILE, 'r') as f:
+        return json.load(f)
 
-@app.route("/index")
-@login_required
+def save_data(data):
+    with open(DATA_FILE, 'w') as f:
+        json.dump(data, f)
+
+@app.route('/')
 def index():
-    return render_template("index.html")
+    return render_template('index.html')
 
-# Login route
-@app.route("/login", methods=["GET", "POST"])
+@app.route('/login', methods=['GET', 'POST'])
 def login():
-    if "username" in session:
-        return redirect("/index")  # Redirect to index if user is already logged in
-    
-    if request.method == "POST":
-        email = request.form.get("email")
-        password = request.form.get("password")
-        
-        # Connect to the database
-        conn = sqlite3.connect("members.db")  # Change the filename as needed
-        cursor = conn.cursor()
-        
-        # Check if the user exists and password matches
-        query = "SELECT * FROM users WHERE email = ? AND password = ?"
-        cursor.execute(query, (email, password))
-        user = cursor.fetchone()
-        
-        if user:
-            session["username"] = user[0]  # Store username in session
+    data = load_data()
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        user = next((u for u in data['users'] if u['username'] == username), None)
+
+        if user and sha256.verify(password, user['password']):
+            if user.get('otp_secret'):
+                if '2fa_token' in request.form:
+                    totp = pyotp.TOTP(user['otp_secret'], interval=30)
+                    if totp.verify(request.form['2fa_token']):
+                        # Proceed with login
+                        return "Login successful!"
+                    else:
+                        return "Invalid 2FA token."
+                else:
+                    return render_template('login.html', user=user)  # Pass user variable here
+            else:
+                # Proceed with login for users without 2FA
+                return "Login successful!"
         else:
-            # If the user is not found, create a new account
-            cursor.execute("INSERT OR IGNORE INTO users (email, password) VALUES (?, ?)", (email, password))
-            session["username"] = email
-        
-        conn.commit()
-        conn.close()
-        
-        return redirect("/index")
+            return "Invalid credentials."
+    return render_template('login.html')  # Do not pass user variable here
 
-    return render_template("login.html")
 
-# Logout route
-@app.route("/logout")
-@login_required
-def logout():
-    session.pop("username", None)
-    return redirect("/login")
+@app.route('/setup', methods=['GET', 'POST'])
+def setup():
+    data = load_data()
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        user = next((u for u in data['users'] if u['username'] == username), None)
 
-if __name__ == "__main__":
-    app.run(debug=True)
+        if user:
+            return "Username already exists. Please choose another username."
+
+        new_user = {
+            'username': username,
+            'password': sha256.hash(password),
+            'email': request.form['email']
+        }
+        new_user['otp_secret'] = pyotp.random_base32() if request.form.get('enable_2fa') else None
+        data['users'].append(new_user)
+        save_data(data)
+
+        return redirect(url_for('dashboard'))
+
+    return render_template('setup.html')
+
+
+@app.route('/verify_2fa/<username>', methods=['POST'])
+def verify_2fa(username):
+    data = load_data()
+    user = next((u for u in data['users'] if u['username'] == username), None)
+
+    if user and user.get('otp_secret') and user['otp_secret']:
+        totp = pyotp.TOTP(user['otp_secret'], interval=30)
+        if totp.verify(request.form['token']):
+            # Proceed with login
+            return "Login successful!"
+        else:
+            return "Invalid 2FA token."
+    else:
+        return "2FA is not enabled for this user."
+
+if __name__ == '__main__':
+    app.run()
